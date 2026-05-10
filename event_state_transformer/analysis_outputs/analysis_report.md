@@ -9,8 +9,6 @@ Top-K coverage: K=5k 87.16%, K=10k 90.40%, K=20k 93.10%, K=50k 95.92%
 Delta p95/p99/p99.5: 10.0/21.0/29.0; recommended max_delta: 30
 Eval prefix/full sequences: 3/3; prefix matches full start: True
 Metadata rows: 10604; matches train sequences: True
-WARNING: matplotlib is not available; plots were skipped.
-WARNING: pandas is not available; metadata analysis used csv fallback.
 ```
 
 ## NPZ keys and arrays
@@ -256,15 +254,24 @@ Eval chord OOV under train vocabularies:
 
 ## H. metadata.csv analysis
 
-- pandas available: False
+- pandas available: True
 - rows: 10,604
 - columns: `Id`, `num_steps`, `num_positions`
 - matches train sequence count: True
 - missing values: `{'Id': 0, 'num_steps': 0, 'num_positions': 0}`
 
+Selected column summaries:
+
+- `Id`: `{'unique': 10604, 'top_values': {'seq_000000': 1, 'seq_007063': 1, 'seq_007065': 1, 'seq_007066': 1, 'seq_007067': 1, 'seq_007068': 1, 'seq_007069': 1, 'seq_007070': 1, 'seq_007071': 1, 'seq_007072': 1, 'seq_007073': 1, 'seq_007074': 1, 'seq_007075': 1, 'seq_007076': 1, 'seq_007077': 1, 'seq_007078': 1, 'seq_007079': 1, 'seq_007080': 1, 'seq_007081': 1, 'seq_007064': 1}}`
+- `num_steps`: `{'count': 10604.0, 'mean': 4852.516974726518, 'std': 2598.947002395843, 'min': 402.0, '25%': 2920.0, '50%': 4406.0, '75%': 6297.25, '90%': 8871.400000000001, '95%': 10182.0, '99%': 11541.909999999998, 'max': 11977.0}`
+
 ## Plots
 
-- No plots generated because matplotlib is unavailable or inputs were empty.
+- `sequence_lengths_seconds.png`
+- `delta_hist_clipped_p99.png`
+- `topk_coverage.png`
+- `note_frequency.png`
+- `notes_per_active_frame.png`
 
 ## Actionable recommendations for event_state_transformer
 
