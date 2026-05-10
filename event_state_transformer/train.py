@@ -34,6 +34,13 @@ def serializable_config(args: argparse.Namespace) -> dict[str, object]:
     return config
 
 
+def apply_resume_model_config(args: argparse.Namespace, ckpt_config: dict[str, object]) -> None:
+    locked_keys = ("context_len", "max_delta", "seed", "val_frac", "d_model", "n_layers", "n_heads", "d_ff", "dropout")
+    for key in locked_keys:
+        if key in ckpt_config:
+            setattr(args, key.replace("-", "_"), ckpt_config[key])
+
+
 @torch.no_grad()
 def evaluate(model: EventStateMusicTransformer, loader: DataLoader, device: torch.device) -> dict[str, float]:
     model.eval()
@@ -72,12 +79,33 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--d-ff", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--resume", type=Path, default=None, help="Resume training from a checkpoint.")
+    parser.add_argument(
+        "--resume-model-only",
+        action="store_true",
+        help="Load only model weights from --resume and start optimizer/scheduler state fresh.",
+    )
     args = parser.parse_args()
+
+    resume_ckpt = None
+    if args.resume is not None:
+        resume_ckpt = torch.load(args.resume, map_location="cpu")
+        apply_resume_model_config(args, resume_ckpt.get("config", {}))
+        print(f"resuming from checkpoint: {args.resume}")
 
     torch.manual_seed(args.seed)
     train_npz = args.train_npz or (args.data_dir / "train.npz")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    vocab_path = args.vocab or (args.out_dir / "vocab.pkl")
+    if args.vocab is not None:
+        vocab_path = args.vocab
+    elif resume_ckpt is not None and "vocab_path" in resume_ckpt.get("config", {}):
+        vocab_path = Path(str(resume_ckpt["config"]["vocab_path"]))
+        if not vocab_path.exists() and args.resume is not None:
+            candidate = args.resume.parent / "vocab.pkl"
+            if candidate.exists():
+                vocab_path = candidate
+    else:
+        vocab_path = args.out_dir / "vocab.pkl"
 
     if vocab_path.exists():
         vocab = ChordVocab.load(vocab_path)
@@ -135,7 +163,29 @@ def main() -> None:
 
     best_val = float("inf")
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 0
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        start_epoch = int(resume_ckpt.get("epoch", 0))
+        global_step = int(resume_ckpt.get("global_step", 0))
+        if "best_val" in resume_ckpt:
+            best_val = float(resume_ckpt["best_val"])
+        elif "val_metrics" in resume_ckpt and "loss" in resume_ckpt["val_metrics"]:
+            best_val = float(resume_ckpt["val_metrics"]["loss"])
+
+        has_full_state = all(key in resume_ckpt for key in ("optimizer_state", "scheduler_state", "scaler_state"))
+        if has_full_state and not args.resume_model_only:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+            scaler.load_state_dict(resume_ckpt["scaler_state"])
+            print(f"loaded full training state at epoch {start_epoch}, global_step {global_step}")
+        else:
+            print(f"loaded model weights at epoch {start_epoch}; optimizer/scheduler state is fresh")
+
+    if start_epoch >= args.epochs:
+        raise ValueError(f"--epochs must be greater than resumed epoch {start_epoch}; got {args.epochs}")
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         running = 0.0
         for step, batch in enumerate(train_loader, start=1):
@@ -162,16 +212,23 @@ def main() -> None:
             f"chord={val_metrics['chord_ce']:.4f} note={val_metrics['note_bce']:.4f}"
         )
 
+        improved = val_metrics["loss"] < best_val
+        if improved:
+            best_val = val_metrics["loss"]
+
         ckpt = {
             "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
             "config": config,
             "epoch": epoch,
             "global_step": global_step,
+            "best_val": best_val,
             "val_metrics": val_metrics,
         }
         torch.save(ckpt, args.out_dir / "last.pt")
-        if val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
+        if improved:
             torch.save(ckpt, args.out_dir / "best.pt")
             print(f"saved best checkpoint: {args.out_dir / 'best.pt'}")
 

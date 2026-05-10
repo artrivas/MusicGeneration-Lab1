@@ -21,4 +21,12 @@ python3 generate.py --data-dir .. --checkpoint runs/event_state/best.pt --out ru
 python3 generate_wav.py --npz runs/event_state/eval_set_01_generated_event_state.npz --out-dir runs/event_state/wav
 ```
 
+Resume training:
+
+```bash
+python3 train.py --data-dir .. --out-dir runs/event_state --resume runs/event_state/last.pt --epochs 60
+```
+
+For older model-only checkpoints, use the same command; the script will load weights and restart optimizer/scheduler state. Add `--resume-model-only` to intentionally do that with a full checkpoint.
+
 The implementation uses event pairs rather than raw frame prediction. Generation uses temperature and nucleus sampling; it does not use argmax.
