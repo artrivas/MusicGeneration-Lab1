@@ -270,7 +270,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     tokenizer = MirexLikePianoTokenizer.load(args.tokenizer)
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    try:
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model_from_checkpoint(ckpt, args, tokenizer.vocab_size).to(device)
     model.load_state_dict(ckpt["model_state"])

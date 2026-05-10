@@ -136,10 +136,10 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
     total_steps = args.epochs * args.steps_per_epoch
 
-    config = vars(args).copy()
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config.update({"vocab_size": tok.vocab_size, "device": str(device)})
     with (args.out_dir / "config.json").open("w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, default=str)
+        json.dump(config, f, indent=2)
 
     metrics_path = args.out_dir / "metrics.csv"
     best_val = float("inf")
