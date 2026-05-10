@@ -19,12 +19,14 @@ class EventStateMusicTransformer(nn.Module):
         n_heads: int = 8,
         d_ff: int = 2048,
         dropout: float = 0.1,
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.max_delta = max_delta
         self.num_notes = num_notes
         self.max_seq_len = max_seq_len
+        self.use_rope = bool(use_rope)
 
         self.chord_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD)
         self.delta_emb = nn.Embedding(max_delta + 1, d_model)
@@ -51,6 +53,7 @@ class EventStateMusicTransformer(nn.Module):
         self.delta_head = nn.Linear(d_model, max_delta + 1)
         self.chord_head = nn.Linear(d_model, vocab_size)
         self.note_head = nn.Linear(d_model, num_notes)
+        self.card_head = nn.Linear(d_model, num_notes + 1)
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -91,10 +94,18 @@ class EventStateMusicTransformer(nn.Module):
             "delta_logits": self.delta_head(x),
             "chord_logits": self.chord_head(x),
             "note_logits": self.note_head(x),
+            "card_logits": self.card_head(x),
         }
 
 
-def event_state_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+def event_state_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    delta_weight: float = 1.0,
+    chord_weight: float = 0.5,
+    note_weight: float = 1.0,
+    card_weight: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, float]]:
     mask = batch["target_mask"]
     denom = mask.sum().clamp_min(1).float()
 
@@ -118,11 +129,24 @@ def event_state_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Te
     ).mean(dim=-1)
     note_loss = (note_loss_all * mask.float()).sum() / denom
 
-    loss = delta_loss + chord_loss + 0.25 * note_loss
+    card_loss_all = F.cross_entropy(
+        outputs["card_logits"].transpose(1, 2),
+        batch["card_target"].clamp(0, 88),
+        reduction="none",
+    )
+    card_loss = (card_loss_all * mask.float()).sum() / denom
+
+    loss = (
+        delta_weight * delta_loss
+        + chord_weight * chord_loss
+        + note_weight * note_loss
+        + card_weight * card_loss
+    )
     metrics = {
         "loss": float(loss.detach().cpu()),
         "delta_ce": float(delta_loss.detach().cpu()),
         "chord_ce": float(chord_loss.detach().cpu()),
         "note_bce": float(note_loss.detach().cpu()),
+        "card_ce": float(card_loss.detach().cpu()),
     }
     return loss, metrics

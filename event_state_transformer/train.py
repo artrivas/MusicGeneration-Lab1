@@ -63,15 +63,18 @@ def main() -> None:
     parser.add_argument("--train-npz", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/event_state"))
     parser.add_argument("--vocab", type=Path, default=None)
-    parser.add_argument("--top-k", type=int, default=50_000)
+    parser.add_argument("--top-k", type=int, default=20_000)
     parser.add_argument("--context-len", type=int, default=1024)
-    parser.add_argument("--max-delta", type=int, default=1200)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-delta", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=300)
+    parser.add_argument("--samples-per-sequence", type=int, default=8)
+    parser.add_argument("--use-rope", action="store_true")
+    parser.add_argument("--max-train-steps", type=int, default=None, help="Stop after this many optimizer steps.")
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--d-model", type=int, default=512)
@@ -86,6 +89,8 @@ def main() -> None:
         help="Load only model weights from --resume and start optimizer/scheduler state fresh.",
     )
     args = parser.parse_args()
+    if args.use_rope:
+        print("warning: --use-rope is recorded in config, but RoPE attention is not implemented; using absolute position embeddings.")
 
     resume_ckpt = None
     if args.resume is not None:
@@ -120,8 +125,24 @@ def main() -> None:
     train_idx, val_idx = split_sequence_indices(len(offsets) - 1, val_frac=args.val_frac, seed=args.seed)
     print(f"split sequences: train={len(train_idx)} val={len(val_idx)}")
 
-    train_ds = EventChunkDataset(train_npz, vocab, train_idx, args.context_len, args.max_delta, random_crop=True)
-    val_ds = EventChunkDataset(train_npz, vocab, val_idx, args.context_len, args.max_delta, random_crop=False)
+    train_ds = EventChunkDataset(
+        train_npz,
+        vocab,
+        train_idx,
+        args.context_len,
+        args.max_delta,
+        random_crop=True,
+        samples_per_sequence=args.samples_per_sequence,
+    )
+    val_ds = EventChunkDataset(
+        train_npz,
+        vocab,
+        val_idx,
+        args.context_len,
+        args.max_delta,
+        random_crop=False,
+        samples_per_sequence=1,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -150,12 +171,15 @@ def main() -> None:
         n_heads=args.n_heads,
         d_ff=args.d_ff,
         dropout=args.dropout,
+        use_rope=args.use_rope,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = max(1, args.epochs * len(train_loader))
-    scheduler = make_scheduler(optimizer, args.warmup_steps, total_steps)
+    effective_warmup = min(args.warmup_steps, max(10, int(0.1 * total_steps)))
+    scheduler = make_scheduler(optimizer, effective_warmup, total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    print(f"total_steps={total_steps} effective_warmup={effective_warmup}")
 
     config = serializable_config(args)
     config.update({"vocab_size": vocab.size, "num_notes": vocab.num_notes, "vocab_path": str(vocab_path)})
@@ -163,9 +187,15 @@ def main() -> None:
 
     best_val = float("inf")
     global_step = 0
+    run_steps = 0
     start_epoch = 0
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        incompatible = model.load_state_dict(resume_ckpt["model_state"], strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                "warning: loaded checkpoint with non-strict state dict; "
+                f"missing={incompatible.missing_keys} unexpected={incompatible.unexpected_keys}"
+            )
         start_epoch = int(resume_ckpt.get("epoch", 0))
         global_step = int(resume_ckpt.get("global_step", 0))
         if "best_val" in resume_ckpt:
@@ -174,7 +204,8 @@ def main() -> None:
             best_val = float(resume_ckpt["val_metrics"]["loss"])
 
         has_full_state = all(key in resume_ckpt for key in ("optimizer_state", "scheduler_state", "scaler_state"))
-        if has_full_state and not args.resume_model_only:
+        can_load_training_state = has_full_state and not args.resume_model_only and not incompatible.missing_keys and not incompatible.unexpected_keys
+        if can_load_training_state:
             optimizer.load_state_dict(resume_ckpt["optimizer_state"])
             scheduler.load_state_dict(resume_ckpt["scheduler_state"])
             scaler.load_state_dict(resume_ckpt["scaler_state"])
@@ -188,6 +219,7 @@ def main() -> None:
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         running = 0.0
+        epoch_steps = 0
         for step, batch in enumerate(train_loader, start=1):
             batch = move_batch(batch, device)
             optimizer.zero_grad(set_to_none=True)
@@ -201,15 +233,21 @@ def main() -> None:
             scaler.update()
             scheduler.step()
             running += float(loss.detach().cpu())
+            epoch_steps += 1
             global_step += 1
+            run_steps += 1
             if step % 25 == 0:
                 print(f"epoch {epoch} step {step}/{len(train_loader)} train_loss={running / step:.4f}")
+            if args.max_train_steps is not None and run_steps >= args.max_train_steps:
+                print(f"stopping early at global_step={global_step} run_steps={run_steps} due to --max-train-steps")
+                break
 
         val_metrics = evaluate(model, val_loader, device)
         print(
-            f"epoch {epoch} train_loss={running / max(1, len(train_loader)):.4f} "
+            f"epoch {epoch} train_loss={running / max(1, epoch_steps):.4f} "
             f"val_loss={val_metrics['loss']:.4f} delta={val_metrics['delta_ce']:.4f} "
-            f"chord={val_metrics['chord_ce']:.4f} note={val_metrics['note_bce']:.4f}"
+            f"chord={val_metrics['chord_ce']:.4f} note={val_metrics['note_bce']:.4f} "
+            f"card={val_metrics['card_ce']:.4f}"
         )
 
         improved = val_metrics["loss"] < best_val
@@ -231,6 +269,8 @@ def main() -> None:
         if improved:
             torch.save(ckpt, args.out_dir / "best.pt")
             print(f"saved best checkpoint: {args.out_dir / 'best.pt'}")
+        if args.max_train_steps is not None and run_steps >= args.max_train_steps:
+            break
 
 
 if __name__ == "__main__":

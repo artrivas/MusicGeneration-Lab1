@@ -90,6 +90,7 @@ class EventChunkDataset(Dataset):
         context_len: int = 1024,
         max_delta: int = 1200,
         random_crop: bool = True,
+        samples_per_sequence: int = 1,
     ) -> None:
         self.rolls_flat, self.offsets, self.data = load_rolls_flat_npz(npz_path)
         self.vocab = vocab
@@ -97,15 +98,20 @@ class EventChunkDataset(Dataset):
         self.context_len = int(context_len)
         self.max_delta = int(max_delta)
         self.random_crop = bool(random_crop)
+        self.samples_per_sequence = max(1, int(samples_per_sequence))
         self.events = [
             roll_to_events(sequence_view(self.rolls_flat, self.offsets, i), vocab, max_delta=max_delta)
             for i in self.sequence_indices
         ]
 
     def __len__(self) -> int:
+        if self.random_crop:
+            return len(self.events) * self.samples_per_sequence
         return len(self.events)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self.random_crop and self.events:
+            index = index % len(self.events)
         ev = self.events[index]
         need = self.context_len + 1
         n = len(ev.delta)
@@ -137,6 +143,7 @@ class EventChunkDataset(Dataset):
             "delta_target": torch.as_tensor(delta[1:], dtype=torch.long),
             "chord_target": torch.as_tensor(chord[1:], dtype=torch.long),
             "notes_target": torch.as_tensor(notes[1:], dtype=torch.float32),
+            "card_target": torch.as_tensor(card[1:], dtype=torch.long),
             "target_mask": torch.as_tensor(chord[1:] != PAD, dtype=torch.bool),
         }
 

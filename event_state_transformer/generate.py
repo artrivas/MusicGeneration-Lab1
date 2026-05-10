@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
+import random
 from typing import Any
 
 import numpy as np
@@ -27,20 +29,42 @@ def sample_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: float |
     return int(torch.multinomial(probs, 1).item())
 
 
-def sample_unknown_notes(note_logits: torch.Tensor, temperature: float = 0.9, max_notes: int = 8) -> np.ndarray:
-    probs = torch.sigmoid(note_logits.float() / max(temperature, 1e-6))
-    sampled = torch.bernoulli(probs).bool()
-    if not sampled.any():
-        k = min(max_notes, probs.numel())
-        idx = torch.topk(probs, k=max(1, min(3, k))).indices
-        sampled[idx] = True
-    elif int(sampled.sum()) > max_notes:
-        active_probs = probs.masked_fill(~sampled, -1.0)
-        keep = torch.topk(active_probs, k=max_notes).indices
-        new_sampled = torch.zeros_like(sampled)
-        new_sampled[keep] = True
-        sampled = new_sampled
+def sample_notes_with_cardinality(
+    note_logits: torch.Tensor,
+    k: int,
+    temperature: float = 0.9,
+    top_p: float | None = None,
+) -> np.ndarray:
+    k = max(1, min(int(k), int(note_logits.numel())))
+    logits = note_logits.float() / max(temperature, 1e-6)
+    probs = torch.sigmoid(logits)
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cdf = torch.cumsum(sorted_probs / sorted_probs.sum().clamp_min(1e-12), dim=-1)
+        keep = cdf <= top_p
+        keep[0] = True
+        allowed = torch.zeros_like(probs, dtype=torch.bool)
+        allowed[sorted_idx[keep]] = True
+        probs = probs.masked_fill(~allowed, 0.0)
+    if int((probs > 0).sum().item()) < k:
+        idx = torch.topk(probs, k=k).indices
+    else:
+        idx = torch.multinomial(probs / probs.sum().clamp_min(1e-12), k, replacement=False)
+    sampled = torch.zeros_like(probs, dtype=torch.uint8)
+    sampled[idx] = 1
     return sampled.cpu().numpy().astype(np.uint8)
+
+
+def sample_cardinality(card_logits: torch.Tensor, temperature: float, min_notes: int, max_notes: int) -> int:
+    logits = card_logits.float().clone()
+    logits[: max(1, min_notes)] = -float("inf")
+    logits[max_notes + 1 :] = -float("inf")
+    if max_notes >= 5:
+        logits[5 : max_notes + 1] -= 0.75
+    if max_notes >= 8:
+        logits[8:] = -float("inf")
+    k = sample_logits(logits, temperature=temperature)
+    return max(min_notes, min(int(k), max_notes))
 
 
 def build_model_from_checkpoint(checkpoint: Path, device: torch.device) -> tuple[EventStateMusicTransformer, dict[str, Any]]:
@@ -56,8 +80,14 @@ def build_model_from_checkpoint(checkpoint: Path, device: torch.device) -> tuple
         n_heads=int(cfg["n_heads"]),
         d_ff=int(cfg["d_ff"]),
         dropout=float(cfg["dropout"]),
+        use_rope=bool(cfg.get("use_rope", False)),
     ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    incompatible = model.load_state_dict(ckpt["model_state"], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            "warning: loaded checkpoint with non-strict state dict; "
+            f"missing={incompatible.missing_keys} unexpected={incompatible.unexpected_keys}"
+        )
     model.eval()
     return model, cfg
 
@@ -74,6 +104,13 @@ def generate_one(
     delta_temp: float,
     chord_temp: float,
     chord_top_p: float,
+    note_temp: float,
+    card_temp: float,
+    min_notes: int,
+    max_notes: int,
+    repeat_penalty: float,
+    max_same_chord_run: int,
+    prefer_note_head_prob: float,
 ) -> np.ndarray:
     out = np.zeros((total_steps, vocab.num_notes), dtype=np.uint8)
     copy_len = min(len(prefix_roll), total_steps)
@@ -103,24 +140,49 @@ def generate_one(
         delta_logits = outputs["delta_logits"][0, -1].clone()
         chord_logits = outputs["chord_logits"][0, -1].clone()
         note_logits = outputs["note_logits"][0, -1]
+        card_logits = outputs["card_logits"][0, -1]
 
         delta_logits[0] = -float("inf")
+        delta_logits[max_delta + 1 :] = -float("inf")
         sampled_delta = sample_logits(delta_logits, temperature=delta_temp)
         sampled_delta = max(1, min(int(sampled_delta), max_delta))
 
         chord_logits[PAD] = -float("inf")
         chord_logits[BOS] = -float("inf")
+        chord_logits[EOS] = -float("inf")
+        recent_counts = Counter(chords[-64:])
+        penalty = max(1.0, repeat_penalty)
+        if penalty > 1.0:
+            for chord_id, count in recent_counts.items():
+                if 0 <= chord_id < chord_logits.numel():
+                    chord_logits[chord_id] -= float(count) * float(np.log(penalty))
+        if max_same_chord_run > 0 and chords:
+            run_id = chords[-1]
+            run_len = 0
+            for chord_id in reversed(chords):
+                if chord_id != run_id:
+                    break
+                run_len += 1
+            if run_len >= max_same_chord_run and 0 <= run_id < chord_logits.numel():
+                chord_logits[run_id] = -float("inf")
         sampled_chord = sample_logits(chord_logits, temperature=chord_temp, top_p=chord_top_p)
         if sampled_chord == EOS:
             sampled_chord = UNK_CHORD
+        sampled_card = sample_cardinality(card_logits, card_temp, min_notes, max_notes)
 
         cumulative_step += sampled_delta
         if cumulative_step >= total_steps:
             break
 
         decoded = vocab.decode_id(sampled_chord)
-        if decoded is None:
-            decoded = sample_unknown_notes(note_logits)
+        use_note_head = decoded is None or random.random() < prefer_note_head_prob
+        if decoded is not None:
+            decoded = decoded.astype(np.uint8, copy=False)
+            decoded_card = int(decoded.sum())
+            if decoded_card <= 0 or decoded_card > max_notes:
+                use_note_head = True
+        if use_note_head:
+            decoded = sample_notes_with_cardinality(note_logits, sampled_card, temperature=note_temp)
         decoded = decoded.astype(np.uint8, copy=False)
         out[cumulative_step, : vocab.num_notes] = decoded
 
@@ -165,9 +227,18 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("runs/event_state/eval_set_01_generated_event_state.npz"))
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--delta-temp", type=float, default=0.8)
-    parser.add_argument("--chord-temp", type=float, default=0.9)
-    parser.add_argument("--chord-top-p", type=float, default=0.9)
+    parser.add_argument("--chord-temp", type=float, default=0.95)
+    parser.add_argument("--chord-top-p", type=float, default=0.92)
+    parser.add_argument("--note-temp", type=float, default=0.9)
+    parser.add_argument("--card-temp", type=float, default=0.9)
+    parser.add_argument("--max-notes", type=int, default=7)
+    parser.add_argument("--min-notes", type=int, default=1)
+    parser.add_argument("--repeat-penalty", type=float, default=1.15)
+    parser.add_argument("--max-same-chord-run", type=int, default=3)
+    parser.add_argument("--prefer-note-head-prob", type=float, default=0.25)
     args = parser.parse_args()
+    args.min_notes = max(1, int(args.min_notes))
+    args.max_notes = max(args.min_notes, int(args.max_notes))
 
     prefix_npz = args.prefix_npz or (args.data_dir / "eval_set_01_prefix.npz")
     full_npz = args.full_npz or (args.data_dir / "eval_set_01_full.npz")
@@ -205,6 +276,13 @@ def main() -> None:
             args.delta_temp,
             args.chord_temp,
             args.chord_top_p,
+            args.note_temp,
+            args.card_temp,
+            args.min_notes,
+            args.max_notes,
+            args.repeat_penalty,
+            args.max_same_chord_run,
+            args.prefer_note_head_prob,
         )
         rolls.append(roll)
         print(f"generated {i + 1}/{len(prefix_offsets) - 1}: prefix={len(prefix)} total={len(roll)} events={int((roll.sum(axis=1) > 0).sum())}")
