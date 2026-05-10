@@ -33,8 +33,14 @@ def prepare_token_cache(
     ids_path = cache_dir / "ids.npy"
     info_path = cache_dir / "dataset_info.json"
     if tokenizer_path.exists() and tokens_path.exists() and offsets_path.exists() and info_path.exists():
-        print(f"token cache already exists: {cache_dir}")
-        return
+        with tokenizer_path.open("r", encoding="utf-8") as f:
+            existing_tok = json.load(f)
+        with info_path.open("r", encoding="utf-8") as f:
+            existing_info = json.load(f)
+        if existing_tok.get("stats") and "train_avg_notes_per_event" in existing_info:
+            print(f"token cache already exists: {cache_dir}")
+            return
+        print("existing token cache is missing new diagnostics; rebuilding token cache metadata and tokens")
 
     data = np.load(train_npz, allow_pickle=True)
     if "rolls_flat" not in data.files or "offsets" not in data.files:
@@ -58,12 +64,33 @@ def prepare_token_cache(
     time_shift_count = 0
     chord_count = 0
     unk_count = 0
+    note_count = 0
+    event_frame_count = 0
+    silent_runs: list[int] = []
+
+    def collect_roll_stats(roll: np.ndarray) -> None:
+        nonlocal note_count, event_frame_count
+        cur_silent = 0
+        for frame in roll:
+            notes = int(np.asarray(frame).sum())
+            if notes > 0:
+                event_frame_count += 1
+                note_count += notes
+                if cur_silent:
+                    silent_runs.append(cur_silent)
+                    cur_silent = 0
+            else:
+                cur_silent += 1
+        if cur_silent:
+            silent_runs.append(cur_silent)
 
     try:
         for seq_idx in range(len(offsets) - 1):
             start = int(offsets[seq_idx])
             end = int(offsets[seq_idx + 1])
-            tokens = tokenizer.encode_roll(rolls_flat[start:end], add_bos=True, add_eos=True)
+            roll = rolls_flat[start:end]
+            collect_roll_stats(roll)
+            tokens = tokenizer.encode_roll(roll, add_bos=True, add_eos=True)
             arr = np.asarray(tokens, dtype=np.int32)
             token_sequences.append(arr)
             token_offsets.append(token_offsets[-1] + len(arr))
@@ -80,6 +107,22 @@ def prepare_token_cache(
     np.save(offsets_path, np.asarray(token_offsets, dtype=np.int64))
     np.save(ids_path, ids)
 
+    musical_tokens = max(1, time_shift_count + chord_count)
+    avg_notes_per_event = float(note_count / max(1, event_frame_count))
+    silent_mean = float(np.mean(silent_runs)) if silent_runs else 0.0
+    silent_p95 = float(np.percentile(silent_runs, 95)) if silent_runs else 0.0
+    top_chords = sorted(tokenizer.chord_counts.items(), key=lambda kv: kv[1], reverse=True)[:20]
+    rare_chords = sum(1 for c in tokenizer.chord_counts.values() if c <= max(1, min_chord_freq))
+    tokenizer.stats = {
+        "train_event_density": float(tokenizer.event_density),
+        "train_avg_notes_per_event": avg_notes_per_event,
+        "train_longest_silent_run_mean": silent_mean,
+        "train_longest_silent_run_p95": silent_p95,
+        "train_chord_ratio": float(chord_count / musical_tokens),
+        "train_timeshift_ratio": float(time_shift_count / musical_tokens),
+    }
+    tokenizer.save(tokenizer_path)
+
     info = {
         "source_npz": str(train_npz),
         "num_sequences": int(len(offsets) - 1),
@@ -90,9 +133,21 @@ def prepare_token_cache(
         "min_chord_freq": int(min_chord_freq),
         "max_chord_vocab": int(max_chord_vocab),
         "event_density": float(tokenizer.event_density),
+        "train_event_density": float(tokenizer.event_density),
+        "train_avg_notes_per_event": avg_notes_per_event,
+        "train_longest_silent_run_mean": silent_mean,
+        "train_longest_silent_run_p95": silent_p95,
+        "train_chord_ratio": float(chord_count / musical_tokens),
+        "train_timeshift_ratio": float(time_shift_count / musical_tokens),
         "time_shift_token_count": int(time_shift_count),
         "chord_token_count": int(chord_count),
         "unk_chord_token_count": int(unk_count),
+        "num_time_shift_tokens": int(max_shift),
+        "num_chord_tokens": int(len(tokenizer.chord_to_id)),
+        "time_shift_token_percent": float(100.0 * time_shift_count / max(1, len(tokens_flat))),
+        "chord_token_percent": float(100.0 * chord_count / max(1, len(tokens_flat))),
+        "top_20_chord_frequencies": [{"chord": k, "count": int(v)} for k, v in top_chords],
+        "num_rare_chords": int(rare_chords),
         "step_sec": scalar(data, "step_sec", 0.05),
         "note_min": scalar(data, "note_min", 21),
         "note_max": scalar(data, "note_max", 108),
@@ -103,6 +158,15 @@ def prepare_token_cache(
         json.dump(info, f, indent=2)
     print(f"saved token cache: {cache_dir}")
     print(f"vocab_size={tokenizer.vocab_size} total_tokens={len(tokens_flat)} event_density={tokenizer.event_density:.6f}")
+    print(
+        f"chord_tokens={len(tokenizer.chord_to_id)} time_shift_tokens={max_shift} "
+        f"token_mix: chord={100.0 * chord_count / max(1, len(tokens_flat)):.2f}% "
+        f"time_shift={100.0 * time_shift_count / max(1, len(tokens_flat)):.2f}% "
+        f"avg_notes_per_event={avg_notes_per_event:.3f} silent_p95={silent_p95:.1f}"
+    )
+    print("top 20 chord frequencies:")
+    for key, count in top_chords:
+        print(f"  {key}: {count}")
 
 
 def main() -> None:

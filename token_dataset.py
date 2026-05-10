@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from tokenizer import PianoEventTokenizer
+
 
 class TokenWindowDataset(Dataset):
     """Random fixed-length token windows with sequence-level train/val split."""
@@ -19,6 +21,10 @@ class TokenWindowDataset(Dataset):
         val_fraction: float = 0.1,
         steps_per_epoch: int = 1000,
         seed: int = 1234,
+        tokenizer: PianoEventTokenizer | None = None,
+        transpose_augmentation: bool = False,
+        transpose_min: int = -5,
+        transpose_max: int = 6,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.context_len = int(context_len)
@@ -26,6 +32,10 @@ class TokenWindowDataset(Dataset):
         self.split = split
         self.steps_per_epoch = int(steps_per_epoch)
         self.rng = np.random.default_rng(seed + (0 if split == "train" else 100_000))
+        self.tokenizer = tokenizer
+        self.transpose_augmentation = bool(transpose_augmentation and split == "train" and tokenizer is not None)
+        self.transpose_min = int(transpose_min)
+        self.transpose_max = int(transpose_max)
         self.tokens_flat = np.load(self.cache_dir / "tokens_flat.npy", mmap_mode="r")
         self.token_offsets = np.load(self.cache_dir / "token_offsets.npy", mmap_mode="r").astype(np.int64, copy=False)
 
@@ -73,6 +83,27 @@ class TokenWindowDataset(Dataset):
         start_in_seq = int(self.rng.integers(0, seq_len - self.window_len + 1))
         start = int(self.token_offsets[seq_idx]) + start_in_seq
         window = np.asarray(self.tokens_flat[start : start + self.window_len], dtype=np.int64)
+        if self.transpose_augmentation:
+            shift = int(self.rng.integers(self.transpose_min, self.transpose_max + 1))
+            if shift != 0:
+                window = self._transpose_window(window, shift)
         input_ids = torch.from_numpy(window[:-1].copy())
         target_ids = torch.from_numpy(window[1:].copy())
         return input_ids, target_ids
+
+    def _transpose_window(self, window: np.ndarray, semitones: int) -> np.ndarray:
+        assert self.tokenizer is not None
+        out = window.copy()
+        for i, token in enumerate(out):
+            token = int(token)
+            if not self.tokenizer.is_chord(token):
+                continue
+            notes = self.tokenizer.id_to_chord.get(token, [])
+            shifted = [n + semitones for n in notes]
+            if not shifted or min(shifted) < 0 or max(shifted) >= self.tokenizer.num_notes:
+                continue
+            key = self.tokenizer.chord_key_from_indices(shifted)
+            new_token = self.tokenizer.chord_to_id.get(key)
+            if new_token is not None:
+                out[i] = new_token
+        return out

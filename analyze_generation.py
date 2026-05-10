@@ -33,16 +33,29 @@ def longest_silent_run(roll: np.ndarray) -> int:
     return best
 
 
+def event_density(roll: np.ndarray) -> float:
+    if len(roll) == 0:
+        return 0.0
+    return float((roll.sum(axis=1) > 0).sum() / len(roll))
+
+
+def unique_chords(roll: np.ndarray) -> int:
+    event_frames = roll[roll.sum(axis=1) > 0]
+    return len({chord_key(frame) for frame in event_frames})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze generated piano-roll NPZ for silence or noisy density.")
     parser.add_argument("--npz", type=Path, required=True)
     parser.add_argument("--prefix_npz", type=Path, default=None)
+    parser.add_argument("--full_npz", type=Path, default=None)
     parser.add_argument("--tokenizer", type=Path, default=None)
     parser.add_argument("--training_event_density", type=float, default=None)
     args = parser.parse_args()
 
     data = np.load(args.npz, allow_pickle=True)
     prefix_data = np.load(args.prefix_npz, allow_pickle=True) if args.prefix_npz is not None else None
+    full_data = np.load(args.full_npz, allow_pickle=True) if args.full_npz is not None else None
     training_density = args.training_event_density
     if args.tokenizer is not None:
         training_density = PianoEventTokenizer.load(args.tokenizer).event_density
@@ -86,6 +99,16 @@ def main() -> None:
             )
         elif training_density is None and event_density > 0.2:
             print("  WARNING: generated event density is high for sparse onset data.")
+        if full_data is not None:
+            full_roll = get_sequence(full_data, i)
+            real = full_roll[prefix_steps : prefix_steps + len(generated)]
+            print("  full_file_comparison:")
+            print(f"    real_event_density: {event_density(real):.6f}")
+            print(f"    generated_event_density: {event_density(generated):.6f}")
+            print(f"    real_longest_silent_run: {longest_silent_run(real)}")
+            print(f"    generated_longest_silent_run: {longest_silent_run(generated)}")
+            print(f"    real_unique_chords: {unique_chords(real)}")
+            print(f"    generated_unique_chords: {unique_chords(generated)}")
 
 
 if __name__ == "__main__":

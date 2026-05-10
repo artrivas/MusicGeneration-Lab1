@@ -35,6 +35,7 @@ class PianoEventTokenizer:
         self.id_to_chord: dict[int, list[int]] = {}
         self.chord_counts: dict[str, int] = {}
         self.event_density = 0.0
+        self.stats: dict[str, float] = {}
 
     @property
     def vocab_size(self) -> int:
@@ -51,8 +52,25 @@ class PianoEventTokenizer:
     def time_shift_value(self, token_id: int) -> int:
         return int(token_id) - self.time_shift_start + 1
 
+    def get_time_shift_value(self, token_id: int) -> int:
+        return self.time_shift_value(token_id)
+
     def is_chord(self, token_id: int) -> bool:
         return int(token_id) >= self.chord_start
+
+    def chord_token_ids(self) -> list[int]:
+        return list(range(self.chord_start, self.vocab_size))
+
+    def time_shift_token_ids(self) -> list[int]:
+        return list(range(self.time_shift_start, self.chord_start))
+
+    def decode_chord_token(self, token_id: int) -> np.ndarray:
+        frame = np.zeros(self.num_notes, dtype=np.uint8)
+        if self.is_chord(token_id):
+            for note_idx in self.id_to_chord.get(int(token_id), []):
+                if 0 <= note_idx < self.num_notes:
+                    frame[note_idx] = 1
+        return frame
 
     def chord_key_from_indices(self, indices: np.ndarray | list[int]) -> str:
         return ",".join(str(int(i)) for i in indices)
@@ -207,6 +225,7 @@ class PianoEventTokenizer:
             "chord_to_id": self.chord_to_id,
             "chord_counts": self.chord_counts,
             "event_density": self.event_density,
+            "stats": self.stats,
             "vocab_size": self.vocab_size,
         }
 
@@ -236,6 +255,7 @@ class PianoEventTokenizer:
         }
         tok.chord_counts = {str(k): int(v) for k, v in obj.get("chord_counts", {}).items()}
         tok.event_density = float(obj.get("event_density", 0.0))
+        tok.stats = {str(k): float(v) for k, v in obj.get("stats", {}).items()}
         return tok
 
 

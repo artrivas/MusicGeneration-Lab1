@@ -83,13 +83,21 @@ python train_token_model.py \
   --d_model 384 \
   --n_layers 8 \
   --n_heads 8 \
-  --dropout 0.1 \
+  --dropout 0.15 \
+  --weight_decay 0.01 \
+  --label_smoothing 0.02 \
+  --scheduler cosine \
+  --warmup_steps 500 \
+  --grad_clip 1.0 \
   --amp
 ```
 
 Training uses token-level `CrossEntropyLoss(ignore_index=PAD)`, AdamW, gradient
 clipping, sequence-level validation split, CUDA/CPU auto-detection, optional AMP,
-and checkpoint resume.
+and checkpoint resume. It also writes `checkpoints_token/metrics.csv` with
+perplexity, target/predicted chord ratios, top-1/top-5 accuracy, and type-specific
+top-5 accuracy. Optional `--transpose_augmentation` can transpose chord tokens
+when the shifted chord exists in the observed vocabulary.
 
 Resume:
 
@@ -119,13 +127,25 @@ python generate_token.py \
   --checkpoint checkpoints_token/best.pt \
   --tokenizer token_cache/tokenizer.json \
   --prefix_npz eval_set_01_prefix.npz \
-  --out_npz outputs/eval_set_01_generated_token.npz \
+  --out_npz outputs/eval_set_01_generated_controlled.npz \
   --continuation_steps 2048 \
   --context_len 1024 \
-  --temperature 0.85 \
-  --top_k 32 \
+  --temperature 0.90 \
+  --top_k 48 \
   --top_p 0.95 \
-  --repetition_penalty 1.1
+  --density_control \
+  --target_density_auto \
+  --min_target_density 0.08 \
+  --max_target_density 0.32 \
+  --density_strength 1.5 \
+  --max_silent_frames 48 \
+  --silence_penalty 3.0 \
+  --chord_boost_after_silence 1.5 \
+  --chord_repetition_penalty 1.15 \
+  --recent_chord_window 32 \
+  --max_same_chord_repeats 8 \
+  --mask_long_time_shifts \
+  --debug_generation_stats
 ```
 
 Mode B, exact total length for every sequence:
@@ -158,7 +178,7 @@ Generation behavior:
 
 - Encodes the prefix roll into event tokens.
 - Samples event tokens autoregressively using temperature, top-k, and top-p.
-- Applies simple density and repetition controls.
+- Applies adaptive density, long-silence, and chord-specific repetition controls.
 - Decodes tokens back to `[T, 88]`.
 - Restores the original prefix frames exactly.
 - Pads/truncates to the requested target frame length.
@@ -183,7 +203,7 @@ Output fields include:
 
 ```bash
 python analyze_generation.py \
-  --npz outputs/eval_set_01_generated_token.npz \
+  --npz outputs/eval_set_01_generated_controlled.npz \
   --prefix_npz eval_set_01_prefix.npz
 ```
 
@@ -191,9 +211,18 @@ With training density warning:
 
 ```bash
 python analyze_generation.py \
-  --npz outputs/eval_set_01_generated_token.npz \
+  --npz outputs/eval_set_01_generated_controlled.npz \
   --prefix_npz eval_set_01_prefix.npz \
   --tokenizer token_cache/tokenizer.json
+```
+
+Local full-file comparison, if available:
+
+```bash
+python analyze_generation.py \
+  --npz outputs/eval_set_01_generated_controlled.npz \
+  --prefix_npz eval_set_01_prefix.npz \
+  --full_npz eval_set_01_full.npz
 ```
 
 The analyzer prints generated note counts, event density, unique chord patterns,
@@ -204,9 +233,9 @@ density.
 
 ```bash
 python preview_audio.py \
-  --npz outputs/eval_set_01_generated_token.npz \
+  --npz outputs/eval_set_01_generated_controlled.npz \
   --index 0 \
-  --out_wav outputs/generated_token_0.wav \
+  --out_wav outputs/generated_controlled_0.wav \
   --num_steps 2048
 ```
 
@@ -235,4 +264,3 @@ events directly.
 - `analyze_generation.py`: checks generated files for silence/noise.
 - `preview_audio.py`: exports WAV previews via `audio_play.py`.
 - `inspect_npz.py`: prints dataset structure and metadata.
-
