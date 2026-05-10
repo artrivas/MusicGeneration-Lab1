@@ -68,14 +68,25 @@ python newapproach/generate.py \
   --checkpoint newapproach/checkpoints/best.pt \
   --tokenizer newapproach/cache/tokenizer.json \
   --prefix_npz eval_set_01_prefix.npz \
-  --out_npz newapproach/outputs/generated.npz \
+  --out_npz newapproach/outputs/generated_less_repetitive.npz \
   --continuation_steps 2048 \
   --context_len 1024 \
-  --temperature 0.90 \
-  --top_k 48 \
-  --top_p 0.95 \
+  --temperature 0.95 \
+  --top_k 80 \
+  --top_p 0.97 \
   --density_control \
   --target_density_auto \
+  --density_margin 0.03 \
+  --density_strength 0.5 \
+  --soft_max_silent_frames 64 \
+  --hard_max_silent_frames 128 \
+  --pattern_repetition_penalty 1.25 \
+  --recent_pattern_window 64 \
+  --max_same_pattern_repeats 6 \
+  --note_frequency_penalty 0.15 \
+  --recent_note_window 128 \
+  --no_repeat_ngram_size 8 \
+  --ngram_window 256 \
   --debug_generation_stats
 ```
 

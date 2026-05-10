@@ -39,16 +39,128 @@ def apply_repetition_penalty(logits: torch.Tensor, recent: deque[int], penalty: 
         logits[token] = logits[token] / penalty if logits[token] > 0 else logits[token] * penalty
 
 
-def block_repeated_ngram(logits: torch.Tensor, tokens: list[int], n: int) -> None:
-    if n <= 1 or len(tokens) < n - 1:
+def block_repeated_ngram(logits: torch.Tensor, generated_tokens: list[int], n: int, window: int) -> None:
+    if n <= 1 or len(generated_tokens) < n - 1:
         return
-    prefix = tuple(tokens[-(n - 1) :])
+    recent = generated_tokens[-int(window) :] if window > 0 else generated_tokens
+    if len(recent) < n - 1:
+        return
+    prefix = tuple(recent[-(n - 1) :])
     banned = set()
-    for i in range(len(tokens) - n + 1):
-        if tuple(tokens[i : i + n - 1]) == prefix:
-            banned.add(tokens[i + n - 1])
+    for i in range(len(recent) - n + 1):
+        if tuple(recent[i : i + n - 1]) == prefix:
+            banned.add(recent[i + n - 1])
     for token in banned:
         logits[int(token)] = -float("inf")
+
+
+def pattern_key(note_indices: set[int] | list[int] | tuple[int, ...]) -> str:
+    return "-".join(str(int(n)) for n in sorted(note_indices))
+
+
+def intervals_for_pattern(note_indices: set[int] | list[int] | tuple[int, ...]) -> list[int]:
+    notes = sorted(int(n) for n in note_indices)
+    intervals: list[int] = []
+    for i in range(len(notes)):
+        for j in range(i + 1, len(notes)):
+            intervals.append(abs(notes[j] - notes[i]) % 12)
+    return intervals
+
+
+def append_bounded(deq: deque, counter: Counter, value: int | str) -> None:
+    if deq.maxlen == 0:
+        return
+    if deq.maxlen is not None and len(deq) == deq.maxlen:
+        old = deq[0]
+        counter[old] -= 1
+        if counter[old] <= 0:
+            del counter[old]
+    deq.append(value)
+    counter[value] += 1
+
+
+def apply_pattern_penalties(
+    logits: torch.Tensor,
+    tokenizer: MirexLikePianoTokenizer,
+    open_chord_notes: set[int],
+    recent_pattern_counts: Counter,
+    args: argparse.Namespace,
+) -> int:
+    activations = 0
+    if args.pattern_repetition_penalty <= 1.0 or not recent_pattern_counts:
+        return activations
+
+    def penalty_for_count(count: int) -> float:
+        if count <= 0:
+            return 0.0
+        return math.log(args.pattern_repetition_penalty) * float(count)
+
+    for token_id in tokenizer.note_on_token_ids():
+        note_idx = tokenizer.get_note_pitch(token_id) - tokenizer.note_min
+        candidate = set(open_chord_notes)
+        candidate.add(note_idx)
+        key = pattern_key(candidate)
+        count = int(recent_pattern_counts.get(key, 0))
+        if count:
+            logits[token_id] -= penalty_for_count(count)
+            activations += 1
+        if count >= args.max_same_pattern_repeats:
+            logits[token_id] -= 4.0
+
+    if open_chord_notes:
+        key = pattern_key(open_chord_notes)
+        count = int(recent_pattern_counts.get(key, 0))
+        if count:
+            logits[tokenizer.CHORD_END] -= penalty_for_count(count)
+            activations += 1
+        if count >= args.max_same_pattern_repeats:
+            logits[tokenizer.CHORD_END] -= 6.0
+    return activations
+
+
+def apply_note_frequency_penalty(
+    logits: torch.Tensor,
+    tokenizer: MirexLikePianoTokenizer,
+    recent_note_counts: Counter,
+    penalty: float,
+) -> int:
+    if penalty <= 0.0 or not recent_note_counts:
+        return 0
+    activations = 0
+    for note_idx, count in recent_note_counts.items():
+        if count <= 0:
+            continue
+        token_id = tokenizer.note_on_id(int(note_idx))
+        logits[token_id] -= float(penalty) * float(count)
+        activations += 1
+    return activations
+
+
+def apply_interval_penalty(
+    logits: torch.Tensor,
+    tokenizer: MirexLikePianoTokenizer,
+    open_chord_notes: set[int],
+    recent_interval_counts: Counter,
+    args: argparse.Namespace,
+) -> int:
+    if args.interval_repetition_penalty <= 0.0 or not recent_interval_counts:
+        return 0
+    total = max(1, sum(int(v) for v in recent_interval_counts.values()))
+    activations = 0
+    for token_id in tokenizer.note_on_token_ids():
+        note_idx = tokenizer.get_note_pitch(token_id) - tokenizer.note_min
+        if note_idx in open_chord_notes:
+            continue
+        candidate_intervals = [abs(int(note_idx) - int(n)) % 12 for n in open_chord_notes]
+        penalty = 0.0
+        for interval in candidate_intervals:
+            share = recent_interval_counts.get(interval, 0) / total
+            if share > 0.25:
+                penalty += args.interval_repetition_penalty * (1.0 + 4.0 * (share - 0.25))
+        if penalty:
+            logits[token_id] -= penalty
+            activations += 1
+    return activations
 
 
 def top_k_top_p_sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> int:
@@ -109,6 +221,12 @@ def generate_one(
     tokens = list(prefix_tokens)
     generated_tokens: list[int] = []
     recent = deque(maxlen=128)
+    recent_patterns: deque[str] = deque(maxlen=args.recent_pattern_window)
+    recent_pattern_counts: Counter[str] = Counter()
+    recent_notes: deque[int] = deque(maxlen=args.recent_note_window)
+    recent_note_counts: Counter[int] = Counter()
+    recent_intervals: deque[int] = deque(maxlen=args.recent_interval_window)
+    recent_interval_counts: Counter[int] = Counter()
     prefix_density = event_density(prefix_roll)
     if args.target_density_auto:
         target_density = 0.60 * float(train_density) + 0.40 * float(prefix_density)
@@ -123,6 +241,7 @@ def generate_one(
     open_chord_notes: set[int] = set()
     open_chord_tokens = 0
     density_acts = silence_acts = chord_acts = 0
+    pattern_acts = note_freq_acts = interval_acts = ngram_acts = 0
     context_len = int(args.context_len)
 
     time_ids = tokenizer.time_shift_token_ids()
@@ -137,7 +256,15 @@ def generate_one(
             logits[tokenizer.EOS] -= 2.0
 
         apply_repetition_penalty(logits, recent, args.repetition_penalty)
-        block_repeated_ngram(logits, tokens, args.no_repeat_ngram_size)
+        before_finite = torch.isfinite(logits).sum().item()
+        block_repeated_ngram(logits, generated_tokens, args.no_repeat_ngram_size, args.ngram_window)
+        after_finite = torch.isfinite(logits).sum().item()
+        if after_finite < before_finite:
+            ngram_acts += 1
+
+        pattern_acts += apply_pattern_penalties(logits, tokenizer, open_chord_notes, recent_pattern_counts, args)
+        note_freq_acts += apply_note_frequency_penalty(logits, tokenizer, recent_note_counts, args.note_frequency_penalty)
+        interval_acts += apply_interval_penalty(logits, tokenizer, open_chord_notes, recent_interval_counts, args)
 
         if args.note_repetition_penalty > 1.0:
             for note_idx in open_chord_notes:
@@ -155,10 +282,14 @@ def generate_one(
                 logits[note_ids] -= 0.5 * args.density_strength
                 density_acts += 1
 
-        if current_silent_run > args.max_silent_frames:
+        if current_silent_run > args.soft_max_silent_frames:
+            excess = min(1.0, (current_silent_run - args.soft_max_silent_frames) / max(1, args.hard_max_silent_frames - args.soft_max_silent_frames))
+            logits[time_ids] -= args.silence_penalty * (0.35 + 0.65 * excess)
+            logits[note_ids] += args.note_boost_after_silence * (0.35 + 0.65 * excess)
+            silence_acts += 1
+        if current_silent_run > args.hard_max_silent_frames:
             logits[time_ids] -= args.silence_penalty
             logits[note_ids] += args.note_boost_after_silence
-            silence_acts += 1
 
         if open_chord_notes:
             if open_chord_tokens >= args.max_open_chord_tokens or len(open_chord_notes) >= args.max_notes_per_chord:
@@ -180,6 +311,12 @@ def generate_one(
                 gen_frames += 1
                 gen_event_frames += 1
                 generated_note_count += len(open_chord_notes)
+                key = pattern_key(open_chord_notes)
+                append_bounded(recent_patterns, recent_pattern_counts, key)
+                for note_idx in open_chord_notes:
+                    append_bounded(recent_notes, recent_note_counts, int(note_idx))
+                for interval in intervals_for_pattern(open_chord_notes):
+                    append_bounded(recent_intervals, recent_interval_counts, int(interval))
                 open_chord_notes.clear()
                 open_chord_tokens = 0
                 current_silent_run = 0
@@ -196,6 +333,12 @@ def generate_one(
                 gen_frames += 1
                 gen_event_frames += 1
                 generated_note_count += len(open_chord_notes)
+                key = pattern_key(open_chord_notes)
+                append_bounded(recent_patterns, recent_pattern_counts, key)
+                for note_idx in open_chord_notes:
+                    append_bounded(recent_notes, recent_note_counts, int(note_idx))
+                for interval in intervals_for_pattern(open_chord_notes):
+                    append_bounded(recent_intervals, recent_interval_counts, int(interval))
                 current_silent_run = 0
             open_chord_notes.clear()
             open_chord_tokens = 0
@@ -227,6 +370,10 @@ def generate_one(
             "number_of_density_control_activations": int(density_acts),
             "number_of_silence_control_activations": int(silence_acts),
             "number_of_chord_end_control_activations": int(chord_acts),
+            "number_of_pattern_control_activations": int(pattern_acts),
+            "number_of_note_frequency_control_activations": int(note_freq_acts),
+            "number_of_interval_control_activations": int(interval_acts),
+            "number_of_ngram_blocks": int(ngram_acts),
         }
     )
     return final_roll, stats
@@ -244,9 +391,9 @@ def main() -> None:
     parser.add_argument("--match_full_lengths", action="store_true")
     parser.add_argument("--context_len", type=int, default=1024)
     parser.add_argument("--model_type", choices=["transformer", "rwkv"])
-    parser.add_argument("--temperature", type=float, default=0.90)
-    parser.add_argument("--top_k", type=int, default=48)
-    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--temperature", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=80)
+    parser.add_argument("--top_p", type=float, default=0.97)
     parser.add_argument("--density_control", action="store_true")
     parser.add_argument("--target_density_auto", action="store_true")
     parser.add_argument("--target_density", type=float, default=0.18)
@@ -254,18 +401,31 @@ def main() -> None:
     parser.add_argument("--max_target_density", type=float, default=0.32)
     parser.add_argument("--density_margin", type=float, default=0.03)
     parser.add_argument("--density_strength", type=float, default=0.5)
-    parser.add_argument("--max_silent_frames", type=int, default=80)
+    parser.add_argument("--soft_max_silent_frames", type=int, default=64)
+    parser.add_argument("--hard_max_silent_frames", type=int, default=128)
+    parser.add_argument("--max_silent_frames", type=int, help="Deprecated alias for --hard_max_silent_frames.")
     parser.add_argument("--silence_penalty", type=float, default=1.5)
     parser.add_argument("--note_boost_after_silence", type=float, default=0.8)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--note_repetition_penalty", type=float, default=1.05)
-    parser.add_argument("--no_repeat_ngram_size", type=int, default=0)
+    parser.add_argument("--pattern_repetition_penalty", type=float, default=1.25)
+    parser.add_argument("--recent_pattern_window", type=int, default=64)
+    parser.add_argument("--max_same_pattern_repeats", type=int, default=6)
+    parser.add_argument("--note_frequency_penalty", type=float, default=0.15)
+    parser.add_argument("--recent_note_window", type=int, default=128)
+    parser.add_argument("--interval_repetition_penalty", type=float, default=0.10)
+    parser.add_argument("--recent_interval_window", type=int, default=64)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=8)
+    parser.add_argument("--ngram_window", type=int, default=256)
     parser.add_argument("--max_notes_per_chord", type=int, default=8)
     parser.add_argument("--max_open_chord_tokens", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=20000)
     parser.add_argument("--debug_generation_stats", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
+    if args.max_silent_frames is not None:
+        args.hard_max_silent_frames = args.max_silent_frames
+        args.soft_max_silent_frames = min(args.soft_max_silent_frames, args.hard_max_silent_frames)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -311,6 +471,10 @@ def main() -> None:
                 "number_of_density_control_activations",
                 "number_of_silence_control_activations",
                 "number_of_chord_end_control_activations",
+                "number_of_pattern_control_activations",
+                "number_of_note_frequency_control_activations",
+                "number_of_interval_control_activations",
+                "number_of_ngram_blocks",
             ]:
                 print(f"  {key}: {stats[key]}")
 
