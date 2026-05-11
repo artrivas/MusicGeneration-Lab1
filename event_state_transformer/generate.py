@@ -102,6 +102,9 @@ def generate_one(
     max_delta: int,
     context_len: int,
     delta_temp: float,
+    delta_top_p: float | None,
+    max_sampled_delta: int | None,
+    silence_delta_penalty: float,
     chord_temp: float,
     chord_top_p: float,
     note_temp: float,
@@ -144,7 +147,12 @@ def generate_one(
 
         delta_logits[0] = -float("inf")
         delta_logits[max_delta + 1 :] = -float("inf")
-        sampled_delta = sample_logits(delta_logits, temperature=delta_temp)
+        if max_sampled_delta is not None:
+            delta_logits[max(1, max_sampled_delta) + 1 :] = -float("inf")
+        if silence_delta_penalty > 0.0:
+            delta_ids = torch.arange(delta_logits.numel(), device=delta_logits.device, dtype=delta_logits.dtype)
+            delta_logits = delta_logits - float(silence_delta_penalty) * delta_ids
+        sampled_delta = sample_logits(delta_logits, temperature=delta_temp, top_p=delta_top_p)
         sampled_delta = max(1, min(int(sampled_delta), max_delta))
 
         chord_logits[PAD] = -float("inf")
@@ -227,6 +235,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("runs/event_state/eval_set_01_generated_event_state.npz"))
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--delta-temp", type=float, default=0.8)
+    parser.add_argument("--delta-top-p", type=float, default=None)
+    parser.add_argument("--max-sampled-delta", type=int, default=None)
+    parser.add_argument("--silence-delta-penalty", type=float, default=0.0)
     parser.add_argument("--chord-temp", type=float, default=0.95)
     parser.add_argument("--chord-top-p", type=float, default=0.92)
     parser.add_argument("--note-temp", type=float, default=0.9)
@@ -274,6 +285,9 @@ def main() -> None:
             max_delta,
             context_len,
             args.delta_temp,
+            args.delta_top_p,
+            args.max_sampled_delta,
+            args.silence_delta_penalty,
             args.chord_temp,
             args.chord_top_p,
             args.note_temp,
